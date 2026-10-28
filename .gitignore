@@ -1,0 +1,4 @@
+sharun
+*.AppImage
+glibc-*/
+AppDir/
