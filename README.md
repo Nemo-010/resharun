@@ -42,41 +42,44 @@ the whole exercise.
 
 ## Requirements
 
-* `sharun` next to this script, from
-  [pkgforge-dev/Anylinux-sharun](https://github.com/pkgforge-dev/Anylinux-sharun)
-  (not the `-aio` build: a wrapped sharun unpacks itself to `/tmp` and can
-  no longer find the AppDir):
-
-  ```sh
-  curl -LO https://github.com/pkgforge-dev/Anylinux-sharun/releases/latest/download/sharun-x86_64
-  mv sharun-x86_64 sharun && chmod +x sharun
-  ```
-
 * `python3` for `elfinfo.py`
 * `unsquashfs` and `mksquashfs` (4.6 or newer) in `PATH`, or via the
   `UNSQUASHFS` / `MKSQUASHFS` environment variables
 * `ldd` from the glibc of the host, which is how the requirement of the host
   libraries is measured
-* a glibc payload, which `fetch-glibc.sh` downloads
+* `curl` or `wget`, only to download what is not there yet
+
+`sharun` and the glibc payload are downloaded when they are missing, so
+nothing has to be fetched by hand. Downloads go to
+`${XDG_CACHE_HOME:-~/.cache}/resharun` and are reused; `RESHARUN_CACHE`,
+`SHARUN` and `-g` override them, which is what you want after the first run
+or on a machine without a network.
 
 ## Usage
 
 ```sh
-# a payload, the newest one by default
-./fetch-glibc.sh                 # prints e.g. glibc-2.44+r50+g1848099f063e/usr/lib
-./fetch-glibc.sh 2.41            # or a release you want to pin
-./fetch-glibc.sh -d /tmp/glibc   # or unpack it somewhere else
-
-# rewrite an AppImage
-./resharun.sh -g glibc-2.44+r50+g1848099f063e/usr/lib -o app-glibc.AppImage app.AppImage
-
-# or an already unpacked AppDir, in place
-./resharun.sh -g glibc/usr/lib AppDir
+./resharun.sh app.AppImage
 ```
 
-Options: `-o` output file, `-f` ignore the version gates, `-k` keep the
-unpacked AppDir, `--smoke BIN` run `BIN` with `LD_DEBUG=libs` after the
-build and report which `libc.so.6` was loaded.
+That is the whole thing: sharun is fetched from
+[Anylinux-sharun](https://github.com/pkgforge-dev/Anylinux-sharun) (pinned
+release, checked against a known sha256, the way quick-sharun does it), the
+newest glibc payload is fetched from the Arch repository, the AppImage is
+rewritten as `app-glibc.AppImage`, and both stay in the cache.
+
+Options: `-o` output file, `-g` a payload you already have, `-f` ignore the
+version gates, `-k` keep the unpacked AppDir, `--smoke BIN` run `BIN` with
+`LD_DEBUG=libs` after the build and report which `libc.so.6` was loaded.
+
+Pinning a glibc release, or unpacking one elsewhere:
+
+```sh
+./fetch-glibc.sh                 # newest, prints the path to use with -g
+./fetch-glibc.sh 2.41            # a specific release
+./fetch-glibc.sh -d /tmp/glibcs  # into /tmp/glibcs/glibc-<version>
+
+./resharun.sh -g glibc-2.41/usr/lib app.AppImage
+```
 
 ## Which glibc
 

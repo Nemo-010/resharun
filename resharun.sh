@@ -13,9 +13,9 @@
 #
 # usage: resharun.sh [-f] [-k] [-o OUT.AppImage] [-g GLIBC_DIR] APPIMAGE|APPDIR
 #
-#   -g GLIBC_DIR  glibc payload to inject: the usr/lib of an Arch glibc
-#                 package (ld-linux*.so* + libc.so.6), see fetch-glibc.sh.
-#                 Env: SHARUN_GLIBC
+#   -g GLIBC_DIR  glibc payload to inject, the usr/lib of an Arch glibc
+#                 package. Without it the newest one is downloaded once and
+#                 kept in the cache. Env: SHARUN_GLIBC
 #   -o OUT        output AppImage (default: <name>-glibc.AppImage)
 #   -f            go on even if the payload is older than what the binaries
 #                 of the AppImage, or the libraries it takes from the host,
@@ -23,15 +23,48 @@
 #   -k            keep the unpacked AppDir for inspection
 #   --smoke BIN   after building, run BIN (path inside the AppDir) with
 #                 LD_DEBUG=libs and report where libc.so.6 came from
+#
+# sharun is taken from SHARUN, from next to this script, or from PATH, and
+# downloaded from Anylinux-sharun otherwise. Downloads are cached in
+# ${XDG_CACHE_HOME:-~/.cache}/resharun, RESHARUN_CACHE moves that.
 
 set -eu
 
 PROG=${0##*/}
 SELF_DIR=$(cd "$(dirname "$0")" && pwd)
-SHARUN=${SHARUN:-$(if [ -x "$SELF_DIR/sharun" ]; then
-	echo "$SELF_DIR/sharun"; else command -v sharun || true; fi)}
+SHARUN=${SHARUN:-}
 UNSQUASHFS=${UNSQUASHFS:-$(command -v unsquashfs || true)}
 MKSQUASHFS=${MKSQUASHFS:-$(command -v mksquashfs || true)}
+
+# what gets downloaded when it is not there, the way quick-sharun does it: a
+# pinned release, checked against a known sha256
+SHARUN_VERSION=${SHARUN_VERSION:-3.8.0}
+SHARUN_BASE=${SHARUN_BASE:-https://github.com/pkgforge-dev/Anylinux-sharun/releases/download/$SHARUN_VERSION}
+CACHE=${RESHARUN_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/resharun}
+
+case $(uname -m) in
+x86_64|amd64)
+	ARCH=x86_64
+	SHARUN_SHA=ed8eb105f29a90a5cdb919b9e0792829842cc264a1758fcb6d12fe5d16aa362b ;;
+aarch64|arm64)
+	ARCH=aarch64
+	SHARUN_SHA=d9f45c07a3a154014407a023be50e0b0714bc452ba09a87e1e438d30058aa812 ;;
+riscv64)
+	ARCH=riscv64
+	SHARUN_SHA=760995ddaf6e33eb74c8cc3d3b58ad5ed1923d2c73f6bd15479d281dc3ebdba0 ;;
+loongarch64)
+	ARCH=loongarch64
+	SHARUN_SHA=ef61d2cc96df4d3c050dab48034594b013779141df89355daf4e6faf0e03ff39 ;;
+ppc64)
+	ARCH=ppc64
+	SHARUN_SHA=9f172689a17128f65408d8deb21ae589b58ed6f2b1943316fdc90920242ac725 ;;
+ppc64le)
+	ARCH=ppc64le
+	SHARUN_SHA=cedc66b45fd58f5c10981095305cce6a2438997265b83a0d1e78786258d37e2d ;;
+*)
+	ARCH=
+	SHARUN_SHA= ;;
+esac
 
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 info() { printf '* %s\n' "$*"; }
@@ -40,6 +73,55 @@ warn() { printf 'WARNING: %s\n' "$*" >&2; }
 usage() {
 	sed -n '2,/^$/{s/^# \{0,1\}//;p}' "$0" >&2
 	exit 1
+}
+
+_download() { # $1 url, $2 file
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL -o "$2" "$1"
+	elif command -v wget >/dev/null 2>&1; then
+		wget -qO "$2" "$1"
+	else
+		return 1
+	fi
+}
+
+# sharun, from SHARUN, from next to this script, from PATH, or from the cache
+# of downloads, in that order
+_ensure_sharun() {
+	[ -n "$SHARUN" ] || {
+		if [ -x "$SELF_DIR/sharun" ]; then
+			SHARUN=$SELF_DIR/sharun
+		elif _p=$(command -v sharun 2>/dev/null); then
+			SHARUN=$_p
+		fi
+	}
+	[ -n "$SHARUN" ] && [ -x "$SHARUN" ] && return 0
+
+	[ -n "$ARCH" ] || die "no sharun build for $(uname -m), put one next to this script"
+	_c=$CACHE/sharun-$SHARUN_VERSION-$ARCH
+	if [ ! -x "$_c" ]; then
+		info "downloading sharun $SHARUN_VERSION for $ARCH"
+		mkdir -p "$CACHE"
+		_download "$SHARUN_BASE/sharun-$ARCH" "$_c.part" ||
+			die "cannot download sharun, put one next to this script or set SHARUN"
+		_sha=$(sha256sum "$_c.part" | cut -d' ' -f1)
+		if [ "$_sha" != "$SHARUN_SHA" ]; then
+			rm -f "$_c.part"
+			die "the downloaded sharun has the wrong sha256: $_sha"
+		fi
+		chmod +x "$_c.part"
+		mv "$_c.part" "$_c"
+	fi
+	SHARUN=$_c
+}
+
+# a glibc payload from fetch-glibc.sh, which takes the newest one in the Arch
+# repository unless a version is asked for
+_ensure_glibc() {
+	[ -n "$GLIBC" ] && return 0
+	[ -x "$SELF_DIR/fetch-glibc.sh" ] ||
+		die "no payload given and no fetch-glibc.sh next to this script, use -g GLIBC_DIR"
+	GLIBC=$("$SELF_DIR/fetch-glibc.sh" -d "$CACHE") || die "cannot fetch a glibc payload"
 }
 
 _elf_field() { # $1 file, $2 field number
@@ -333,10 +415,9 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$INPUT" ] || usage
 
-[ -x "$SHARUN" ] || die "sharun not found, put it next to this script or set SHARUN"
 [ -n "$UNSQUASHFS" ] || die "unsquashfs not found, set UNSQUASHFS"
-
-[ -n "$GLIBC" ] || die "no glibc payload given, use -g GLIBC_DIR"
+_ensure_sharun
+_ensure_glibc
 [ -f "$GLIBC/libc.so.6" ] || die "$GLIBC: not a glibc payload dir"
 
 WORK=$(mktemp -d)

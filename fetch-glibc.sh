@@ -1,12 +1,12 @@
 #!/bin/sh
 # fetch-glibc.sh - download a glibc payload for resharun.sh
 #
-# usage: fetch-glibc.sh [-d DIR] [VERSION]
+# usage: fetch-glibc.sh [-d BASE] [VERSION]
 #
 #   VERSION  a glibc release such as 2.41, or nothing for the newest one in
 #            the Arch repository. Older releases come from the Arch Linux
 #            Archive, so 2.36 and 2.41 are still available.
-#   -d DIR   unpack here instead of ./glibc-<version>
+#   -d BASE  unpack into BASE/glibc-<version> instead of ./glibc-<version>
 #
 # The path to use as `resharun.sh -g` is printed on stdout, the rest goes to
 # stderr. The newest release is the safest choice: a payload older than the
@@ -68,7 +68,7 @@ _file=$(printf '%s\n' "$_file" | tail -n1)
 _enc=$(printf '%s' "$_file" | sed 's/+/%2B/g')
 
 _ver=$(printf '%s\n' "$_file" | sed "s/^$PKG-//; s/-[0-9]*-x86_64.*//")
-[ -n "$DIR" ] || DIR=$PKG-$_ver
+DIR=${DIR:-.}/$PKG-$_ver
 
 if [ -f "$DIR/usr/lib/libc.so.6" ]; then
 	info "$DIR already holds glibc $_ver"
