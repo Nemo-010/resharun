@@ -296,11 +296,18 @@ _route() {
 			# had in the original AppImage, only its content changes
 			ln -f "$APPDIR/sharun" "$_p"
 		else
-			# a program called AppRun, or one whose name is already taken
+			# a program called AppRun, or one whose name is already taken.
+			# The link has to be relative, the AppDir is mounted somewhere
+			# else at run time, and realpath --relative-to is GNU only
 			mkdir -p "$APPDIR/bin"
 			ln -f "$APPDIR/sharun" "$APPDIR/bin/$_name"
-			ln -s "$(realpath -m --relative-to="$(dirname "$_p")" \
-				"$APPDIR/bin/$_name")" "$_p"
+			_up=
+			_d=${_p#"$APPDIR"/}
+			while [ "${_d#*/}" != "$_d" ]; do
+				_up=$_up../
+				_d=${_d#*/}
+			done
+			ln -s "${_up}bin/$_name" "$_p"
 		fi
 		info "routed $_rel -> .bin/$_name"
 	done < "$WORK/execs"

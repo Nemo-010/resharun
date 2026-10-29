@@ -45,9 +45,17 @@ the whole exercise.
 * `python3` for `elfinfo.py`
 * `unsquashfs` and `mksquashfs` (4.6 or newer) in `PATH`, or via the
   `UNSQUASHFS` / `MKSQUASHFS` environment variables
+* `zstd`, only to unpack the Arch package the payload comes from: busybox tar
+  cannot read `.pkg.tar.zst` and GNU tar older than 1.35 needs it too
 * `ldd` from the glibc of the host, which is how the requirement of the host
   libraries is measured
 * `curl` or `wget`, only to download what is not there yet
+
+On a musl distribution such as Alpine, `apk add python3 squashfs-tools zstd`
+covers it, and `elfinfo.py` has to sit next to the scripts. There is no glibc
+`ldd` there, so the measurement of the host libraries comes out empty and its
+check is skipped, which is harmless: a host without glibc has no glibc
+libraries for the payload to be incompatible with.
 
 `sharun` and the glibc payload are downloaded when they are missing, so
 nothing has to be fetched by hand. Downloads go to

@@ -77,6 +77,7 @@ if [ -f "$DIR/usr/lib/libc.so.6" ]; then
 fi
 
 info "downloading $_file"
+mkdir -p "$(dirname "$DIR")"
 _download "$_url$_enc" "$DIR.pkg.tar.zst.part" ||
 	die "download of $_url$_enc failed"
 mv "$DIR.pkg.tar.zst.part" "$DIR.pkg.tar.zst"
@@ -84,9 +85,11 @@ mv "$DIR.pkg.tar.zst.part" "$DIR.pkg.tar.zst"
 mkdir -p "$DIR"
 # GNU tar needs --zstd for anything older than 1.35, busybox tar cannot do it
 # at all, so fall back to zstd itself
-if ! tar -xf "$DIR.pkg.tar.zst" -C "$DIR" 2>/dev/null; then
-	tar --zstd -xf "$DIR.pkg.tar.zst" -C "$DIR" 2>/dev/null ||
-		zstd -dc "$DIR.pkg.tar.zst" | tar -xf - -C "$DIR" ||
+if ! tar -xf "$DIR.pkg.tar.zst" -C "$DIR" 2>/dev/null &&
+	! tar --zstd -xf "$DIR.pkg.tar.zst" -C "$DIR" 2>/dev/null; then
+	command -v zstd >/dev/null 2>&1 ||
+		die "this tar cannot read zstd and zstd is not installed: apk add zstd, dnf install zstd, pacman -S zstd"
+	zstd -dc "$DIR.pkg.tar.zst" | tar -xf - -C "$DIR" ||
 		die "cannot unpack $DIR.pkg.tar.zst"
 fi
 rm -f "$DIR.pkg.tar.zst"
