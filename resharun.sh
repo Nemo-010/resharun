@@ -452,11 +452,13 @@ the AppImage would load all of them from the host"
 # what the bundled loader would not find at run time, so that the first run of
 # the AppImage is not the one that has to report it. Whatever is not in the
 # AppDir has to come from the host, and the payload loader only searches
-# /lib and /usr/lib: never /usr/lib64, where Fedora and openSUSE keep theirs
-_missing_libs() {
+# /lib and /usr/lib: never /usr/lib64, which is where Fedora and openSUSE keep
+# theirs, and never anything at all on a musl system
+_check_libs() {
 	_ld=$(ls "$APPDIR"/lib/ld-linux*.so* 2>/dev/null | head -n1)
 	[ -n "$_ld" ] || return 0
-	_paths=
+	# the bare "+" of lib.path is the lib directory of the AppDir itself
+	_paths=$APPDIR/lib
 	while read -r _e; do
 		case $_e in
 		+/*) _paths=$_paths:$APPDIR/lib/${_e#+/} ;;
@@ -464,17 +466,36 @@ _missing_libs() {
 	done < "$APPDIR/lib/lib.path"
 	for _p in "$APPDIR"/.bin/*; do
 		[ -f "$_p" ] || continue
-		"$_ld" --library-path "${_paths#:}" --list "$_p" 2>&1
-	done | sed -n \
-		-e 's/^[[:space:]]*\([^ ]*\) => not found.*/\1/p' \
-		-e 's/.*error while loading shared libraries: \([^:]*\):.*/\1/p' |
-		sort -u > "$WORK/missing" || true
-	[ -s "$WORK/missing" ] || return 0
-	_n=$(wc -l < "$WORK/missing")
-	warn "$_n libraries it needs are nowhere the bundled loader looks:"
-	sed -n '1,12s/^/    /p' "$WORK/missing" >&2
-	[ "$_n" -le 12 ] || printf '    ... and %s more\n' "$((_n - 12))" >&2
-	[ "$BUNDLE" = 1 ] || warn "the AppImage does not carry them, -b copies them in from a glibc host"
+		"$_ld" --library-path "$_paths" --list "$_p" 2>&1
+	done > "$WORK/resolve" || true
+
+	sed -n -e 's/^[[:space:]]*\([^ ]*\) => not found.*/\1/p' \
+		-e 's/.*error while loading shared libraries: \([^:]*\):.*/\1/p' \
+		"$WORK/resolve" | sort -u > "$WORK/missing"
+	sed -n 's/^[[:space:]]*[^ ]* => \(\/[^ ]*\).*/\1/p' "$WORK/resolve" |
+		grep -v "^$APPDIR/" | sort -u > "$WORK/outside"
+
+	if [ -s "$WORK/missing" ]; then
+		_n=$(wc -l < "$WORK/missing")
+		warn "$_n libraries it needs are nowhere the bundled loader looks:"
+		sed -n '1,12s/^/    /p' "$WORK/missing" >&2
+		[ "$_n" -le 12 ] || printf '    ... and %s more\n' "$((_n - 12))" >&2
+	fi
+	if [ -s "$WORK/outside" ]; then
+		_n=$(wc -l < "$WORK/outside")
+		warn "$_n libraries still come from the host, it runs only where
+they are, in /lib or /usr/lib:"
+		sed -n '1,12s/^/    /p' "$WORK/outside" >&2
+		[ "$_n" -le 12 ] || printf '    ... and %s more\n' "$((_n - 12))" >&2
+		if [ "$BUNDLE" = 1 ]; then
+			warn "they could not be copied in, see the messages above"
+		else
+			warn "-b copies them into the AppDir, which is what a musl
+system such as Alpine needs"
+		fi
+	elif [ ! -s "$WORK/missing" ]; then
+		info "self-contained: every library comes from the AppDir"
+	fi
 	return 0
 }
 
@@ -595,7 +616,7 @@ _bundle_hostlibs
 _route
 _fix_apprun
 _lib_path
-_missing_libs
+_check_libs
 [ -f "$WORK/runtime" ] && _pack
 [ -n "$SMOKE" ] && _smoke "$SMOKE"
 
