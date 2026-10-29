@@ -11,7 +11,7 @@
 # linked with (an absolute path into the host) is never used, and the loader
 # is patched so that it cannot read the host /etc/ld.so.cache either.
 #
-# usage: resharun.sh [-f] [-k] [-o OUT.AppImage] [-g GLIBC_DIR] APPIMAGE|APPDIR
+# usage: resharun.sh [-f] [-k] [-b] [-o OUT.AppImage] [-g GLIBC_DIR] APPIMAGE|APPDIR
 #
 #   -g GLIBC_DIR  glibc payload to inject, the usr/lib of an Arch glibc
 #                 package. Without it the newest one is downloaded once and
@@ -21,6 +21,10 @@
 #                 of the AppImage, or the libraries it takes from the host,
 #                 require
 #   -k            keep the unpacked AppDir for inspection
+#   -b            also copy the libraries the AppImage leaves to the host into
+#                 the AppDir, which is what a musl distribution such as Alpine
+#                 needs: there they are musl objects and the bundled glibc
+#                 cannot load them
 #   --smoke BIN   after building, run BIN (path inside the AppDir) with
 #                 LD_DEBUG=libs and report where libc.so.6 came from
 #
@@ -228,6 +232,62 @@ _host_need() {
 	info "host libraries need up to GLIBC_$HOSTNEED"
 }
 
+# every library that still comes from outside the AppDir, one absolute path
+# per line, for the binaries named on stdin
+_outside_libs() {
+	_libdirs=$(_appdir_libdirs)$APPDIR/lib/hostlib
+	while read -r _p; do
+		LD_LIBRARY_PATH=$_libdirs ldd "$_p" 2>/dev/null |
+			sed -n 's/.*=> \(\/[^ ]*\).*/\1/p'
+	done | sort -u | grep -v "^$APPDIR/" |
+		grep -v '/ld-linux\|/ld-musl\|/ld64' || true
+}
+
+# the libraries an AppImage leaves to the host are what stops it from running
+# where there is no glibc: on Alpine they are musl objects and the bundled
+# loader cannot map them. Copy them in, with everything they need in turn
+_bundle_hostlibs() {
+	[ "$BUNDLE" = 1 ] || return 0
+	# the libraries come out of the host, so the host has to be a glibc one:
+	# on Alpine ldd resolves those names to musl objects, and copying those
+	# into an AppImage that runs on a glibc loader is worse than leaving them
+	# out. Build with -b on a glibc distribution, run the result anywhere
+	ldd --version 2>/dev/null | grep -qi 'GNU libc' ||
+		die "-b copies the libraries of the host, which only works on a glibc
+host: run it there and take the AppImage to the musl system"
+	_dst=$APPDIR/lib/hostlib
+	mkdir -p "$_dst"
+	_list=$WORK/bundle.list
+	{ cat "$WORK/execs"; find "$_dst" -type f -name '*.so*' -print; } > "$_list"
+	_n=0
+	_round=0
+	while [ "$_round" -lt 10 ]; do
+		_round=$((_round + 1))
+		_missing=$(_outside_libs < "$_list")
+		[ -n "$_missing" ] || break
+		_got=0
+		while read -r _l; do
+			[ -n "$_l" ] || continue
+			# the payload owns these, a host copy beside it is a second libc
+			case ${_l##*/} in
+			libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1|\
+			libutil.so.1|libresolv.so.2|libnss_*|ld-linux*|ld64*|libc.so)
+				continue ;;
+			esac
+			[ -e "$_dst/${_l##*/}" ] && continue
+			cp "$_l" "$_dst/${_l##*/}" 2>/dev/null || continue
+			printf '%s\n' "$_dst/${_l##*/}" >> "$_list"
+			_got=$((_got + 1))
+			_n=$((_n + 1))
+		done <<EOF
+$_missing
+EOF
+		[ "$_got" -gt 0 ] || break
+	done
+	[ "$_n" -gt 0 ] && info "bundled $_n libraries the AppImage left to the host"
+	return 0
+}
+
 _inject_glibc() {
 	_src=$GLIBC
 	_dst=$APPDIR/lib
@@ -359,18 +419,32 @@ _fix_apprun() {
 _lib_path() {
 	"$APPDIR/sharun" -g 2>/dev/null || true
 	_lp=$APPDIR/lib/lib.path
-	[ -f "$_lp" ] || : > "$_lp"
+	# sharun -g writes the entries of the payload. If it wrote nothing the file
+	# is empty, and an empty pattern file means "no pattern" to busybox grep,
+	# which then drops every entry added below: the AppImage would be packed
+	# with an empty lib.path and load every library from the host
+	[ -s "$_lp" ] || printf '+\n' > "$_lp"
 	# sharun -g writes no trailing newline, our own entries would glue to it
-	[ -s "$_lp" ] && [ -n "$(tail -c 1 "$_lp")" ] && printf '\n' >> "$_lp"
+	[ -n "$(tail -c 1 "$_lp")" ] && printf '\n' >> "$_lp"
 	# every directory of the AppImage that holds shared objects, they have to
 	# be found before the ones of the host
-	find "$APPDIR" -path "$APPDIR/lib" -prune -o -type d -print | while read -r _d; do
-		set -- "$_d"/*.so*
-		[ -e "$1" ] || continue
-		printf '+/..%s\n' "${_d#"$APPDIR"}"
-	done | sort -u > "$WORK/libdirs"
+	find "$APPDIR" -path "$APPDIR/lib" -prune -o -name '*.so*' -print |
+		while read -r _f; do
+			_d=${_f%/*}
+			[ "$_d" = "$APPDIR" ] || printf '+/..%s\n' "${_d#"$APPDIR"}"
+		done | sort -u > "$WORK/libdirs"
+	# the libraries copied out of the host, if -b was used. Entries are
+	# relative to the lib directory, the way sharun -g writes them
+	[ -d "$APPDIR/lib/hostlib" ] && printf '+/hostlib\n' >> "$WORK/libdirs"
 	grep -Fvxf "$_lp" "$WORK/libdirs" >> "$_lp" || true
-	grep -qx '+' "$_lp" || sed -i '1i +' "$_lp"
+	# nothing of the AppDir in lib.path, but the AppDir does carry libraries:
+	# the AppImage would start and take them from the host, which is the
+	# failure this tool exists to prevent, so stop here instead
+	if ! grep -q '^+/' "$_lp" &&
+		find "$APPDIR" -name '*.so*' -print | grep -q .; then
+		die "the AppDir has shared objects but none of them reached lib.path,
+the AppImage would load all of them from the host"
+	fi
 	info "lib.path: $(tr '\n' ' ' < "$_lp")"
 }
 
@@ -404,6 +478,7 @@ OUT=
 INPUT=
 FORCE=0
 KEEP=0
+BUNDLE=0
 SMOKE=
 while [ $# -gt 0 ]; do
 	case $1 in
@@ -411,6 +486,7 @@ while [ $# -gt 0 ]; do
 	-o) OUT=${2:?}; shift 2 ;;
 	-f) FORCE=1; shift ;;
 	-k) KEEP=1; shift ;;
+	-b) BUNDLE=1; shift ;;
 	--smoke) SMOKE=${2:?}; shift 2 ;;
 	-h|--help) usage ;;
 	-*) die "unknown option $1" ;;
@@ -485,6 +561,7 @@ fi
 mkdir -p "$APPDIR/.bin"
 cp "$SHARUN" "$APPDIR/sharun"
 _inject_glibc
+_bundle_hostlibs
 _route
 _fix_apprun
 _lib_path

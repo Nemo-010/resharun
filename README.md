@@ -76,8 +76,28 @@ newest glibc payload is fetched from the Arch repository, the AppImage is
 rewritten as `app-glibc.AppImage`, and both stay in the cache.
 
 Options: `-o` output file, `-g` a payload you already have, `-f` ignore the
-version gates, `-k` keep the unpacked AppDir, `--smoke BIN` run `BIN` with
-`LD_DEBUG=libs` after the build and report which `libc.so.6` was loaded.
+version gates, `-k` keep the unpacked AppDir, `-b` also bundle the libraries
+the AppImage leaves to the host, `--smoke BIN` run `BIN` with `LD_DEBUG=libs`
+after the build and report which `libc.so.6` was loaded.
+
+## On a musl system
+
+Bundling a glibc is only half of what an AppImage needs to run where the host
+has no glibc. The other half is the libraries it deliberately leaves out of
+the AppDir — `libstdc++`, `libgcc_s`, `libX11`, `libfontconfig`, and whatever
+they pull in. On Alpine those are musl objects, and the bundled loader cannot
+map them, so the AppImage still dies with `no version information available`
+and a segmentation fault.
+
+`-b` copies exactly those libraries out of the build host into
+`lib/hostlib/` and adds it to `lib.path`, until nothing is taken from outside
+the AppDir any more. It needs a glibc host to copy from: build on Fedora,
+Debian or Arch, then take the AppImage to the musl machine.
+
+```sh
+./resharun.sh -b app.AppImage          # on a glibc host
+./app-glibc.AppImage                   # on Alpine
+```
 
 Pinning a glibc release, or unpacking one elsewhere:
 
