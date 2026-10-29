@@ -11,7 +11,8 @@
 # linked with (an absolute path into the host) is never used, and the loader
 # is patched so that it cannot read the host /etc/ld.so.cache either.
 #
-# usage: resharun.sh [-f] [-k] [-b] [-o OUT.AppImage] [-g GLIBC_DIR] APPIMAGE|APPDIR
+# usage: resharun.sh [-f] [-k] [-b] [-o OUT.AppImage] [-g GLIBC_DIR]
+#                    [--hostlibs host|repo] [--smoke BIN] APPIMAGE|APPDIR
 #
 #   -g GLIBC_DIR  glibc payload to inject, the usr/lib of an Arch glibc
 #                 package. Without it the newest one is downloaded once and
@@ -21,10 +22,14 @@
 #                 of the AppImage, or the libraries it takes from the host,
 #                 require
 #   -k            keep the unpacked AppDir for inspection
-#   -b            also copy the libraries the AppImage leaves to the host into
-#                 the AppDir, which is what a musl distribution such as Alpine
-#                 needs: there they are musl objects and the bundled glibc
-#                 cannot load them
+#   -b            also bring in the libraries the AppImage leaves to the host,
+#                 which is what a musl distribution such as Alpine needs: there
+#                 they are musl objects and the bundled glibc cannot load them
+#   --hostlibs host|repo
+#                 where -b takes them from. host copies them out of this
+#                 machine, repo downloads them from the packages of the
+#                 distribution the payload came from. Default: host when this
+#                 machine has glibc, repo when it does not. Env: HOSTLIBS
 #   --smoke BIN   after building, run BIN (path inside the AppDir) with
 #                 LD_DEBUG=libs and report where libc.so.6 came from
 #
@@ -212,8 +217,12 @@ _appdir_libdirs() {
 # the libraries an AppImage does not carry keep coming from the host, and they
 # were built against the glibc of the host. A payload older than the highest
 # GLIBC_x.y among them cannot load them, which is the failure this tool is
-# here to avoid, so measure it instead of guessing
+# here to avoid, so measure it instead of guessing. Only a glibc host can
+# answer: elsewhere ldd resolves the names to musl objects, and the libraries
+# that get bundled are checked instead, once they are there
 _host_need() {
+	HOSTNEED=0
+	[ "$HOSTLIBS" = host ] || return 0
 	_libdirs=$(_appdir_libdirs)
 	while IFS='	' read -r _p _cls _mach _type _interp _runpath _needed _glibc; do
 		[ "$_interp" = "-" ] && continue
@@ -221,7 +230,6 @@ _host_need() {
 			sed -n 's/.*=> \(\/[^ ]*\).*/\1/p'
 	done < "$WORK/execs" | sort -u | grep -v "^$APPDIR/" |
 		grep -v '/ld-linux\|/ld-musl\|/ld64' > "$WORK/hostlibs" || true
-	HOSTNEED=0
 	[ -s "$WORK/hostlibs" ] || return 0
 	# shellcheck disable=SC2046
 	tr '\n' '\0' < "$WORK/hostlibs" |
@@ -232,60 +240,181 @@ _host_need() {
 	info "host libraries need up to GLIBC_$HOSTNEED"
 }
 
-# every library that still comes from outside the AppDir, one absolute path
-# per line, for the binaries named on stdin
-_outside_libs() {
-	_libdirs=$(_appdir_libdirs)$APPDIR/lib/hostlib
-	while read -r _p; do
-		LD_LIBRARY_PATH=$_libdirs ldd "$_p" 2>/dev/null |
-			sed -n 's/.*=> \(\/[^ ]*\).*/\1/p'
-	done | sort -u | grep -v "^$APPDIR/" |
-		grep -v '/ld-linux\|/ld-musl\|/ld64' || true
+# the bundled libraries are the ones that run instead of the host ones, so the
+# payload has to be new enough for them, whichever they came from
+_bundle_need() {
+	[ -d "$APPDIR/lib/hostlib" ] || return 0
+	find "$APPDIR/lib/hostlib" -type f -name '*.so*' > "$WORK/bundled"
+	[ -s "$WORK/bundled" ] || return 0
+	# shellcheck disable=SC2046
+	tr '\n' '\0' < "$WORK/bundled" |
+		xargs -0 -r "$SELF_DIR/elfinfo.py" > "$WORK/bundleinfo"
+	_bn=$(awk -F'\t' '$8 != "-" {print $8}' "$WORK/bundleinfo" |
+		sort -Vu | tail -n1)
+	[ -n "$_bn" ] || return 0
+	if _ver_lt "$GLIBC_VER" "$_bn"; then
+		_who=$(awk -F'\t' -v v="$_bn" '$8 == v {print $1; exit}' \
+			"$WORK/bundleinfo")
+		if [ "$FORCE" = 1 ]; then
+			warn "glibc $GLIBC_VER cannot load $_who, it wants GLIBC_$_bn"
+		else
+			die "glibc $GLIBC_VER is older than GLIBC_$_bn, which $_who,
+bundled from the repository, needs (-f forces)"
+		fi
+	fi
+	info "bundled libraries need up to GLIBC_$_bn"
+}
+
+# the directories the bundled loader searches, in the order lib.path gives
+# them: the payload first, then whatever was bundled beside it, then every
+# directory of the AppImage that holds shared objects
+_search_dirs() {
+	printf '%s\n' "$APPDIR/lib"
+	[ -d "$APPDIR/lib/hostlib" ] && printf '%s\n' "$APPDIR/lib/hostlib"
+	printf '%s\n' "$(_appdir_libdirs)" | tr ':' '\n' | sed '/^$/d'
+}
+
+# what the AppDir does not carry, read out of DT_NEEDED instead of asked of
+# the host: ldd on a musl system resolves the names to musl objects, and on
+# any system it only knows what happens to be installed there. A program says
+# what it needs in the file itself, so that is read, and the libraries it
+# pulls in are followed the same way until nothing new turns up
+_closure() { # $1 files to start from, $2 where to write the sonames
+	_prov=$WORK/providers
+	_search_dirs | while read -r _d; do
+		for _f in "$_d"/*.so*; do
+			[ -f "$_f" ] || continue
+			printf '%s\t%s\n' "${_f##*/}" "$_f"
+		done
+	done | awk -F'\t' '!seen[$1]++' > "$_prov"
+
+	: > "$WORK/seen"
+	: > "$2"
+	cp "$1" "$WORK/queue"
+	while [ -s "$WORK/queue" ]; do
+		tr '\n' '\0' < "$WORK/queue" |
+			xargs -0 -r "$SELF_DIR/elfinfo.py" > "$WORK/round"
+		awk -F'\t' '$7 != "-" {
+			n = split($7, a, ",")
+			for (i = 1; i <= n; i++) print a[i]
+		}' "$WORK/round" | sort -u > "$WORK/need"
+		awk -F'\t' 'NR == FNR { p[$1] = $2; next } !($1 in p)' \
+			"$_prov" "$WORK/need" >> "$2"
+		awk -F'\t' 'NR == FNR { p[$1] = $2; next } ($1 in p) { print p[$1] }' \
+			"$_prov" "$WORK/need" | sort -u > "$WORK/found"
+		sort -u "$WORK/seen" > "$WORK/seen.s"
+		comm -23 "$WORK/found" "$WORK/seen.s" > "$WORK/queue"
+		cat "$WORK/queue" >> "$WORK/seen.s"
+		mv "$WORK/seen.s" "$WORK/seen"
+	done
+	sort -u -o "$2" "$2"
 }
 
 # the libraries an AppImage leaves to the host are what stops it from running
 # where there is no glibc: on Alpine they are musl objects and the bundled
-# loader cannot map them. Copy them in, with everything they need in turn
+# loader cannot map them. Copy them in, with everything they need in turn,
+# either out of the host when that is a glibc one, or out of the packages of
+# the distribution the payload came from, which is what makes this work on a
+# musl system and on one whose own libraries are too old for the application
 _bundle_hostlibs() {
 	[ "$BUNDLE" = 1 ] || return 0
-	# the libraries come out of the host, so the host has to be a glibc one:
-	# on Alpine ldd resolves those names to musl objects, and copying those
-	# into an AppImage that runs on a glibc loader is worse than leaving them
-	# out. Build with -b on a glibc distribution, run the result anywhere
-	ldd --version 2>/dev/null | grep -qi 'GNU libc' ||
-		die "-b copies the libraries of the host, which only works on a glibc
-host: run it there and take the AppImage to the musl system"
 	_dst=$APPDIR/lib/hostlib
 	mkdir -p "$_dst"
-	_list=$WORK/bundle.list
-	{ cat "$WORK/execs"; find "$_dst" -type f -name '*.so*' -print; } > "$_list"
-	_n=0
+	{ cat "$WORK/execs"; find "$_dst" -type f -name '*.so*' -print; } \
+		> "$WORK/seed"
 	_round=0
+	_n=0
 	while [ "$_round" -lt 10 ]; do
 		_round=$((_round + 1))
-		_missing=$(_outside_libs < "$_list")
-		[ -n "$_missing" ] || break
-		_got=0
-		while read -r _l; do
-			[ -n "$_l" ] || continue
-			# the payload owns these, a host copy beside it is a second libc
-			case ${_l##*/} in
-			libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1|\
-			libutil.so.1|libresolv.so.2|libnss_*|ld-linux*|ld64*|libc.so)
-				continue ;;
-			esac
-			[ -e "$_dst/${_l##*/}" ] && continue
-			cp "$_l" "$_dst/${_l##*/}" 2>/dev/null || continue
-			printf '%s\n' "$_dst/${_l##*/}" >> "$_list"
-			_got=$((_got + 1))
-			_n=$((_n + 1))
-		done <<EOF
-$_missing
-EOF
-		[ "$_got" -gt 0 ] || break
+		_closure "$WORK/seed" "$WORK/missing"
+		[ -s "$WORK/missing" ] || break
+		_before=$(find "$_dst" -type f | wc -l)
+		case $HOSTLIBS in
+		repo) _fetch_hostlibs "$WORK/missing" || break ;;
+		*) _copy_hostlibs "$WORK/missing" || break ;;
+		esac
+		find "$_dst" -type f -name '*.so*' -print >> "$WORK/seed"
+		_after=$(find "$_dst" -type f | wc -l)
+		[ "$_after" -gt "$_before" ] || break
+		_n=$_after
 	done
 	[ "$_n" -gt 0 ] && info "bundled $_n libraries the AppImage left to the host"
 	return 0
+}
+
+# out of the host, which has to be a glibc one for the answer to be a glibc
+# library: ldd resolves a name to a path only for a program that asks for it,
+# so every program is asked at once and the answers are filtered by name
+_copy_hostlibs() { # $1 sonames wanted
+	_libdirs=$(_appdir_libdirs)$APPDIR/lib/hostlib
+	while IFS='	' read -r _p _cls _mach _type _interp _runpath _needed _glibc; do
+		[ "$_interp" = "-" ] && continue
+		LD_LIBRARY_PATH=${_libdirs%:} ldd "$_p" 2>/dev/null |
+			sed -n 's/.*=> \(\/[^ ]*\).*/\1/p'
+	done < "$WORK/execs" | sort -u > "$WORK/hostpaths"
+	awk -F'\t' 'NR == FNR { w[$1] = 1; next }
+		{ n = split($0, q, "/"); if ((q[n] in w) && !(q[n] in got)) { got[q[n]] = 1; print } }' \
+		"$1" "$WORK/hostpaths" > "$WORK/tocopy"
+	while read -r _l; do
+		[ -n "$_l" ] || continue
+		cp "$_l" "$APPDIR/lib/hostlib/${_l##*/}" 2>/dev/null || true
+	done < "$WORK/tocopy"
+	return 0
+}
+
+# out of the repository, when the host has nothing to copy from
+_fetch_hostlibs() { # $1 sonames wanted
+	[ -x "$SELF_DIR/fetch-hostlibs.sh" ] ||
+		die "no fetch-hostlibs.sh next to this script, and the host has no glibc
+libraries to copy from"
+	"$SELF_DIR/fetch-hostlibs.sh" -d "$APPDIR/lib/hostlib" < "$1" \
+		> "$WORK/unfetched" || die "fetch-hostlibs.sh failed"
+	if [ -s "$WORK/unfetched" ]; then
+		warn "no package in the repository has these:"
+		sed -n '1,12s/^/    /p' "$WORK/unfetched" >&2
+	fi
+	return 0
+}
+
+# the AppRun of a linuxdeploy AppImage is a bash script (`source`, mostly),
+# and bash is not on a musl system by default, so an AppImage that is
+# otherwise self-contained still cannot start there. The shell it asks for is
+# fetched and routed like the programs are, and AppRun.sh starts the script
+# with that one instead of the one the host has
+_bundle_shell() { # $1 the AppRun script
+	[ "$BUNDLE" = 1 ] || return 0
+	_sb=$(sed -n '1s/^#![[:space:]]*//p' "$1")
+	[ -n "$_sb" ] || return 0
+	# shellcheck disable=SC2086
+	set -- $_sb
+	[ "${1##*/}" = env ] && shift
+	[ $# -gt 0 ] || return 0
+	_name=${1##*/}
+	case $_name in
+	sh|dash|ash|busybox|'')
+		return 0 ;;
+	esac
+	# the host having it is not enough: the point of -b is that the result runs
+	# where the host has nothing, and Alpine has no bash at all
+	if [ -x "$APPDIR/usr/bin/$_name" ] || [ -x "$APPDIR/bin/$_name" ]; then
+		SHELL_BIN=$_name
+		return 0
+	fi
+	info "AppRun asks for $_name, fetching it so that the host need not have it"
+	[ -x "$SELF_DIR/fetch-hostlibs.sh" ] ||
+		die "no fetch-hostlibs.sh next to this script, cannot fetch $_name"
+	printf 'bin/%s\n' "$_name" |
+		"$SELF_DIR/fetch-hostlibs.sh" --bin-dir "$APPDIR/usr/bin" > "$WORK/shell" ||
+		die "cannot fetch $_name"
+	if [ -s "$WORK/shell" ]; then
+		warn "no package in the repository has $_name, the AppRun keeps the one
+of the host"
+		return 0
+	fi
+	chmod +x "$APPDIR/usr/bin/$_name"
+	SHELL_BIN=$_name
+	printf '%s\n' "$APPDIR/usr/bin/$_name" >> "$WORK/execs"
+	info "bundled $_name as the interpreter of AppRun"
 }
 
 _inject_glibc() {
@@ -351,6 +480,7 @@ _route() {
 		fi
 
 		mv "$_p" "$APPDIR/.bin/$_name"
+		printf '%s\t%s\n' "$_rel" "$_name" >> "$WORK/routes"
 		if [ "$_name" = "${_p##*/}" ]; then
 			# sharun in place: /proc/self/exe keeps the path the program
 			# had in the original AppImage, only its content changes
@@ -407,7 +537,12 @@ _fix_apprun() {
 
 	{
 		printf '#!/bin/sh\n'
-		printf 'exec "$(dirname "$0")/%s" "$@"\n' "$_t"
+		if [ -n "$SHELL_BIN" ]; then
+			printf 'exec "$(dirname "$0")/usr/bin/%s" "$(dirname "$0")/%s" "$@"\n' \
+				"$SHELL_BIN" "$_t"
+		else
+			printf 'exec "$(dirname "$0")/%s" "$@"\n' "$_t"
+		fi
 	} > "$APPDIR/AppRun.sh"
 	chmod +x "$APPDIR/AppRun.sh"
 	rm -f "$_ar"
@@ -509,7 +644,16 @@ _pack() {
 }
 
 _smoke() {
-	_bin=$APPDIR/$1
+	# the program has to be started the way the AppImage starts it, through the
+	# hardlink to sharun that took its place: the file in .bin/ still has the
+	# PT_INTERP of the host loader and would load the host libraries, which is
+	# exactly what this test is supposed to catch
+	_rel=$(awk -F'\t' -v n="${1##*/}" '$2 == n { print $1; exit }' \
+		"$WORK/routes" 2>/dev/null)
+	case $1 in
+	.bin/*) _bin=$APPDIR/${_rel:-$1} ;;
+	*) _bin=$APPDIR/$1 ;;
+	esac
 	[ -x "$_bin" ] || die "$1: not executable"
 	# SHARUN_DIR is what AppRun exports for the whole process tree, without
 	# it a program that is started on its own cannot find the AppDir
@@ -531,6 +675,11 @@ FORCE=0
 KEEP=0
 BUNDLE=0
 SMOKE=
+# where -b takes the libraries from: the host when it has glibc, which needs no
+# download and gives the exact ones the AppImage was built against, and the
+# packages of the payload distribution otherwise, which is the only option on a
+# musl system and the right one on a distribution older than the AppImage
+HOSTLIBS=${HOSTLIBS:-}
 while [ $# -gt 0 ]; do
 	case $1 in
 	-g) GLIBC=${2:?}; shift 2 ;;
@@ -538,6 +687,7 @@ while [ $# -gt 0 ]; do
 	-f) FORCE=1; shift ;;
 	-k) KEEP=1; shift ;;
 	-b) BUNDLE=1; shift ;;
+	--hostlibs) HOSTLIBS=${2:?}; shift 2 ;;
 	--smoke) SMOKE=${2:?}; shift 2 ;;
 	-h|--help) usage ;;
 	-*) die "unknown option $1" ;;
@@ -548,6 +698,18 @@ while [ $# -gt 0 ]; do
 	esac
 done
 [ -n "$INPUT" ] || usage
+
+if [ -z "$HOSTLIBS" ]; then
+	if ldd --version 2>/dev/null | grep -qi 'GNU libc'; then
+		HOSTLIBS=host
+	else
+		HOSTLIBS=repo
+	fi
+fi
+case $HOSTLIBS in
+host|repo) ;;
+*) die "--hostlibs takes host or repo, not '$HOSTLIBS'" ;;
+esac
 
 [ -n "$UNSQUASHFS" ] || die "unsquashfs not found, set UNSQUASHFS"
 _ensure_sharun
@@ -609,10 +771,17 @@ from the host needs, so the AppImage would not start here (-f forces)"
 	fi
 fi
 
+SHELL_BIN=
+
 mkdir -p "$APPDIR/.bin"
+: > "$WORK/routes"
 cp "$SHARUN" "$APPDIR/sharun"
 _inject_glibc
+# before the routing: a shell that has to be fetched is a program like the
+# others, it goes through the same path
+[ -f "$APPDIR/AppRun" ] && _bundle_shell "$APPDIR/AppRun"
 _bundle_hostlibs
+_bundle_need
 _route
 _fix_apprun
 _lib_path

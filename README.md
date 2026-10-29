@@ -45,20 +45,20 @@ the whole exercise.
 * `python3` for `elfinfo.py`
 * `unsquashfs` and `mksquashfs` (4.6 or newer) in `PATH`, or via the
   `UNSQUASHFS` / `MKSQUASHFS` environment variables
-* `zstd`, only to unpack the Arch package the payload comes from: busybox tar
-  cannot read `.pkg.tar.zst` and GNU tar older than 1.35 needs it too
+* `zstd`, to unpack the Arch packages the payload and the bundled libraries
+  come from: busybox tar cannot read `.pkg.tar.zst` and GNU tar older than
+  1.35 needs it too
 * `ldd` from the glibc of the host, which is how the requirement of the host
-  libraries is measured
+  libraries is measured, and only when `-b` takes them out of the host
 * `curl` or `wget`, only to download what is not there yet
 
 On a musl distribution such as Alpine, `apk add python3 squashfs-tools zstd`
 covers it, and `elfinfo.py` has to sit next to the scripts. There is no glibc
-`ldd` there, so the measurement of the host libraries comes out empty and its
-check is skipped, which is harmless: a host without glibc has no glibc
-libraries for the payload to be incompatible with.
+`ldd` there, and none is needed: what a program needs is read out of the
+program itself, and the libraries come out of the package repository.
 
-`sharun` and the glibc payload are downloaded when they are missing, so
-nothing has to be fetched by hand. Downloads go to
+`sharun`, the glibc payload and the libraries `-b` brings in are downloaded
+when they are missing, so nothing has to be fetched by hand. Downloads go to
 `${XDG_CACHE_HOME:-~/.cache}/resharun` and are reused; `RESHARUN_CACHE`,
 `SHARUN` and `-g` override them, which is what you want after the first run
 or on a machine without a network.
@@ -77,8 +77,9 @@ rewritten as `app-glibc.AppImage`, and both stay in the cache.
 
 Options: `-o` output file, `-g` a payload you already have, `-f` ignore the
 version gates, `-k` keep the unpacked AppDir, `-b` also bundle the libraries
-the AppImage leaves to the host, `--smoke BIN` run `BIN` with `LD_DEBUG=libs`
-after the build and report which `libc.so.6` was loaded.
+the AppImage leaves to the host, `--hostlibs host|repo` where `-b` takes them
+from, `--smoke BIN` run `BIN` with `LD_DEBUG=libs` after the build and report
+which `libc.so.6` was loaded.
 
 ## On a musl system
 
@@ -89,15 +90,41 @@ they pull in. On Alpine those are musl objects, and the bundled loader cannot
 map them, so the AppImage still dies with `no version information available`
 and a segmentation fault.
 
-`-b` copies exactly those libraries out of the build host into
-`lib/hostlib/` and adds it to `lib.path`, until nothing is taken from outside
-the AppDir any more. It needs a glibc host to copy from: build on Fedora,
-Debian or Arch, then take the AppImage to the musl machine.
+`-b` brings exactly those libraries in, and it does it without a glibc
+machine. What the AppDir does not carry is read out of the `DT_NEEDED` of
+every program, then of every library they pull in, until nothing new turns
+up; nothing is asked of the host, which on a musl system would answer with
+musl objects anyway. Each soname is then looked up in an index of the Arch
+repository and the package that ships it is downloaded, checked against its
+sha256, and unpacked. The same distribution as the payload, so the libraries
+are built against the glibc that ends up in the AppDir.
 
 ```sh
-./resharun.sh -b app.AppImage          # on a glibc host
-./app-glibc.AppImage                   # on Alpine
+./resharun.sh -b app.AppImage          # anywhere, including Alpine
+./app-glibc.AppImage
 ```
+
+`--hostlibs repo` forces the packages, and is the right choice on a
+distribution older than the AppImage was built against: its own libraries may
+be too old for the application, and copying them in would keep the problem.
+`--hostlibs host` copies them out of the machine running the script, which
+needs no download and gives the exact ones the AppImage was built against.
+The default is `host` when `ldd` says GNU libc and `repo` when it does not.
+
+One more thing that a musl system does not have is `bash`, and the AppRun of
+a linuxdeploy AppImage is a bash script. With `-b` the shell the AppRun asks
+for is fetched from the repository as well, routed like the programs are, and
+started by `AppRun.sh`, so the AppImage does not need the one of the host.
+
+What is still taken from the host is what the AppRun *script* runs —
+`dirname`, `readlink`, and the tools of the GTK hook — which every system has,
+busybox included.
+
+The index of the repository is kept in the cache and rebuilt after
+`HOSTLIBS_INDEX_TTL` days (30 by default). Building it is one 51MB download
+that is streamed rather than unpacked; `HOSTLIBS_INDEX_URL` takes a prebuilt
+one instead, which is a few hundred kilobytes, and `HOSTLIBS_MIRROR` moves
+both the index and the packages to another mirror.
 
 Pinning a glibc release, or unpacking one elsewhere:
 
@@ -152,10 +179,11 @@ The kernel is the only thing a payload can be too new for:
 
 ```
 AppRun            copy of sharun
-AppRun.sh         shim that execs AppRun.orig
+AppRun.sh         shim that execs AppRun.orig, or the bundled shell with it
 AppRun.orig       the AppRun script of the original AppImage
 sharun
 lib/              the glibc payload, gconv, and lib.path
+lib/hostlib/      the libraries the AppImage left to the host, with -b
 .bin/<name>       the real programs
 bin/<name>        only for programs whose name was taken or is AppRun
 usr/bin/<name>    hardlink to sharun, was the program
@@ -171,8 +199,10 @@ of the AppImage are found before the ones of the host.
 * the payload must not be older than the highest `GLIBC_x.y` any ELF of the
   AppImage requires, otherwise the programs cannot start
 * the payload must not be older than the highest `GLIBC_x.y` among the host
-  libraries the AppImage loads, which is measured with `ldd` and is what
-  breaks first in practice
+  libraries the AppImage loads, which is measured with `ldd` when the host has
+  one and is what breaks first in practice
+* the payload must not be older than the highest `GLIBC_x.y` among the
+  libraries `-b` bundled, whichever they came from
 * the payload must be 2.33 or newer, because of `--argv0`
 * an AppImage that already carries a libc is refused, it does not need this
 * an AppImage with no dynamic executable is refused, a bundled glibc would
@@ -181,11 +211,17 @@ of the AppImage are found before the ones of the host.
 ## Limits
 
 * `ldd` is only as good as the host it runs on: a library that only exists
-  on the machines of some of the users cannot be measured, only guessed at
+  on the machines of some of the users cannot be measured, only guessed at.
+  With `--hostlibs repo` there is no such limit, the packages are the ones
+  that matter
+* the libraries are only found if they are in a package of the repository:
+  a program that dlopens something nobody else ships is still not covered
 * quick-sharun handles `dlopen` of libraries built for another libc with
   `cross-libc-dlopen`, this script does not bundle it
 * the AppRun shim hands the original script back to its own interpreter, so
-  a bash AppRun still needs bash on the host, exactly as before
+  without `-b` a bash AppRun still needs bash on the host, exactly as before.
+  With `-b` the shell is bundled and routed like a program; what is left to
+  the host is the tools the script itself calls
 * an AppRun that is a binary has to be started through `bin/AppRun.bin`,
   which is not the path it had, so a program that works out its prefix from
   `/proc/self/exe` would land one directory deeper than before; a script or
