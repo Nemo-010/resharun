@@ -441,11 +441,41 @@ _lib_path() {
 	# the AppImage would start and take them from the host, which is the
 	# failure this tool exists to prevent, so stop here instead
 	if ! grep -q '^+/' "$_lp" &&
-		find "$APPDIR" -name '*.so*' -print | grep -q .; then
+		find "$APPDIR" -path "$APPDIR/lib" -prune -o -name '*.so*' -print |
+		grep -q .; then
 		die "the AppDir has shared objects but none of them reached lib.path,
 the AppImage would load all of them from the host"
 	fi
 	info "lib.path: $(tr '\n' ' ' < "$_lp")"
+}
+
+# what the bundled loader would not find at run time, so that the first run of
+# the AppImage is not the one that has to report it. Whatever is not in the
+# AppDir has to come from the host, and the payload loader only searches
+# /lib and /usr/lib: never /usr/lib64, where Fedora and openSUSE keep theirs
+_missing_libs() {
+	_ld=$(ls "$APPDIR"/lib/ld-linux*.so* 2>/dev/null | head -n1)
+	[ -n "$_ld" ] || return 0
+	_paths=
+	while read -r _e; do
+		case $_e in
+		+/*) _paths=$_paths:$APPDIR/lib/${_e#+/} ;;
+		esac
+	done < "$APPDIR/lib/lib.path"
+	for _p in "$APPDIR"/.bin/*; do
+		[ -f "$_p" ] || continue
+		"$_ld" --library-path "${_paths#:}" --list "$_p" 2>&1
+	done | sed -n \
+		-e 's/^[[:space:]]*\([^ ]*\) => not found.*/\1/p' \
+		-e 's/.*error while loading shared libraries: \([^:]*\):.*/\1/p' |
+		sort -u > "$WORK/missing" || true
+	[ -s "$WORK/missing" ] || return 0
+	_n=$(wc -l < "$WORK/missing")
+	warn "$_n libraries it needs are nowhere the bundled loader looks:"
+	sed -n '1,12s/^/    /p' "$WORK/missing" >&2
+	[ "$_n" -le 12 ] || printf '    ... and %s more\n' "$((_n - 12))" >&2
+	[ "$BUNDLE" = 1 ] || warn "the AppImage does not carry them, -b copies them in from a glibc host"
+	return 0
 }
 
 _pack() {
@@ -565,7 +595,7 @@ _bundle_hostlibs
 _route
 _fix_apprun
 _lib_path
-
+_missing_libs
 [ -f "$WORK/runtime" ] && _pack
 [ -n "$SMOKE" ] && _smoke "$SMOKE"
 
